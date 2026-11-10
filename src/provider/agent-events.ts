@@ -206,6 +206,12 @@ export async function* streamAgentTurn(
   // culprit and lets armWatchdog pick the larger budget while a tool runs.
   const openTools = new Map<string, string>();
 
+  // Emitted tool call IDs: track which tool-call events have been pushed to
+  // prevent duplicates when a stalled run is force-resent and both the old
+  // (cancelled) and new runs emit events with the same IDs. Cleared on each
+  // startRun so a fresh run can emit its own set of IDs.
+  const emittedToolCalls = new Set<string>();
+
   const push = (event: CursorEvent) => {
     anyEvent = true;
     queue.push(event);
@@ -253,17 +259,27 @@ export async function* streamAgentTurn(
           input: update.toolCall?.args ?? {},
         });
         break;
-      case "tool-call-started":
+      case "tool-call-started": {
+        const callId = String(update.callId);
+        // Skip duplicate tool-call events: when a stalled run is force-resent,
+        // both the old (cancelled) and new runs can emit tool-call-started with
+        // the same IDs. OpenCode v2 dies on duplicate tool calls, so dedupe here.
+        if (emittedToolCalls.has(callId)) {
+          if (debug) pluginLog("debug", `skipping duplicate tool-call-started: ${callId}`);
+          break;
+        }
+        emittedToolCalls.add(callId);
         // Track the open call BEFORE push() re-arms the watchdog with the
         // larger tool budget.
-        openTools.set(String(update.callId), toolDisplayName(update.toolCall));
+        openTools.set(callId, toolDisplayName(update.toolCall));
         push({
           type: "tool-call",
-          id: String(update.callId),
+          id: callId,
           name: toolDisplayName(update.toolCall),
           input: update.toolCall?.args ?? {},
         });
         break;
+      }
       case "tool-call-completed": {
         openTools.delete(String(update.callId));
         const tool = update.toolCall ?? {};
@@ -332,6 +348,10 @@ export async function* streamAgentTurn(
   let runGen = 0;
   const startRun = (force: boolean): void => {
     const gen = ++runGen;
+    // Clear the emitted tool call set when starting a fresh run (especially on
+    // force-resend) so the new run can emit its own tool calls without being
+    // blocked by IDs from the previous (cancelled) attempt.
+    emittedToolCalls.clear();
     void sendWithRecovery(
       agent,
       message,

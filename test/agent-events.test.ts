@@ -970,6 +970,57 @@ describe("stream watchdog", () => {
 		}
 	});
 
+	it("deduplicates tool calls when the SDK emits duplicate tool-call-started events", async () => {
+		// Simulates the scenario where Cursor SDK (or a stalled-then-force-resent run)
+		// emits tool-call-started with the same callId multiple times. Without deduplication,
+		// OpenCode v2 would die with "Duplicate tool call: <id>".
+		const agent = fakeAgent({
+			updates: [
+				// First tool-call-started with callId "bash-1"
+				{
+					type: "tool-call-started",
+					callId: "bash-1",
+					toolCall: { type: "shell", args: { command: "echo hello" } },
+				},
+				// Duplicate tool-call-started with the SAME callId "bash-1"
+				// (e.g. from a retry, reconnect, or force-resend)
+				{
+					type: "tool-call-started",
+					callId: "bash-1",
+					toolCall: { type: "shell", args: { command: "echo hello" } },
+				},
+				// Tool completes successfully
+				{
+					type: "tool-call-completed",
+					callId: "bash-1",
+					toolCall: {
+						type: "shell",
+						args: { command: "echo hello" },
+						result: { status: "success", value: { stdout: "hello\n", exitCode: 0 } },
+					},
+				},
+				{ type: "text-delta", text: "Done" },
+			],
+			result: { status: "finished", result: "Done" },
+		});
+
+		const events = await collect(
+			streamAgentTurn(agent, MESSAGE, { mode: "agent" }),
+		);
+
+		// Critical assertion: only ONE tool-call event should be emitted (second was deduped)
+		const toolCalls = events.filter((e) => e.type === "tool-call");
+		expect(toolCalls).toHaveLength(1);
+		expect(toolCalls[0]).toMatchObject({ id: "bash-1", name: "shell" });
+
+		// The tool-result should still be emitted and pair with the single tool-call
+		const toolResults = events.filter((e) => e.type === "tool-result");
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0]).toMatchObject({ id: "bash-1", name: "shell", isError: false });
+
+		expect(events.some((e) => e.type === "finish")).toBe(true);
+	});
+
 	it("caps an over-large idle STALL_MS as well", async () => {
 		vi.useFakeTimers();
 		try {
